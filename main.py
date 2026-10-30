@@ -1,227 +1,81 @@
+"""
+RationSeva Stock Validator (port 8001)
 
-import os
-from datetime import datetime, timezone
+Looks up a fair-price shop by fps_id (+ optional commodity) in data/summary.json
+and returns the real reported quantities, status, data_time, source and flags.
+Unknown shops get found=False - nothing is ever fabricated.
 
-from dotenv import load_dotenv
-from uagents import Agent, Context, Protocol
-from uagents_core.contrib.protocols.chat import (
-    ChatAcknowledgement,
-    ChatMessage,
-    EndSessionContent,
-    TextContent,
-    chat_protocol_spec,
-)
+Structured messages only (StockRequest -> StockResponse). The ASI:One chat
+protocol lives in coordinator.py.
+"""
 
-from messages import StockRequest, StockResponse, ValidatedStock
+from uagents import Context
 
-load_dotenv()
+import ration_data as rd
+from common import make_agent
+from messages import CommodityStock, StockFlag, StockRequest, StockResponse
 
-# --------------------------------------------------
-# RATION SEVA — SAMPLE DATA
-# Demonstration data only, NOT live government data.
-# --------------------------------------------------
-
-SAMPLE_STOCK = {
-    "rice": {
-        "opening": 300,
-        "received": 100,
-        "issued": 150,
-        "closing": 250,
-        "report_date": "2026-10-20",
-    },
-    "wheat": {
-        "opening": 100,
-        "received": 20,
-        "issued": 40,
-        "closing": 80,
-        "report_date": "2026-10-20",
-    },
-}
+agent = make_agent("ration_seva_stock_validator", "RATION_VALIDATOR_SEED", 8001, "VALIDATOR_MAILBOX")
 
 
-def validate_stock_values(opening, received, issued, closing):
-    """Check stock quantities and the stock-balance equation."""
-
-    values = [opening, received, issued, closing]
-
-    if any(
-        not isinstance(value, (int, float)) or isinstance(value, bool)
-        for value in values
-    ):
-        return False, "Invalid: stock quantities must be numbers."
-
-    if any(value < 0 for value in values):
-        return False, "Invalid: stock quantities cannot be negative."
-
-    expected_closing = opening + received - issued
-
-    if expected_closing != closing:
-        return (
-            False,
-            f"FAIL: expected closing stock {expected_closing}, "
-            f"but the reported closing stock is {closing}.",
+def lookup(fps_id, commodity=None):
+    shop = rd.find_shop(fps_id)
+    if shop is None:
+        return StockResponse(
+            found=False,
+            fps_id=fps_id,
+            commodity_requested=commodity,
+            data_time=rd.data_time(),
+            message=(f"FPS {fps_id} is not in the dataset ({rd.shop_count()} shops, "
+                     f"AP AePDS report of {rd.data_time()})."),
         )
 
-    return (
-        True,
-        f"PASS: {opening} + {received} - {issued} = {closing}.",
-    )
+    key = rd.commodity_key(commodity) if commodity else None
+    items, flags = [], []
+    for c in rd.ration_items(shop, key):
+        values = (c["closing"], c["received"], c["issued"])
+        if any(v < 0 for v in values):
+            flags.append(StockFlag(commodity=c["commodity"], flag="NEGATIVE_VALUE",
+                                   severity="error", message="Negative quantity in report"))
+        status = rd.classify(c["closing"], c["issued"])
+        if status != c["status"]:
+            flags.append(StockFlag(commodity=c["commodity"], flag="STATUS_MISMATCH", severity="warning",
+                                   message=f"Report status {c['status']}, recomputed {status}"))
+        items.append(CommodityStock(
+            commodity=c["commodity"], unit=c["unit"], closing=c["closing"],
+            received=c["received"], issued=c["issued"],
+            available=round(c["closing"] + c["issued"], 3), status=status,
+        ))
 
+    names = {i.commodity for i in items}
+    flags += [StockFlag(commodity=f["commodity"], flag=f["flag"], severity=f["severity"], message=f["message"])
+              for f in shop.get("flags", []) if f["commodity"] in names]
 
-def get_stock_report(commodity):
-    """Return the sample stock and its validation result."""
-
-    commodity = commodity.lower().strip()
-
-    if commodity not in SAMPLE_STOCK:
-        raise ValueError("Only sample rice and wheat reports are available.")
-
-    report = SAMPLE_STOCK[commodity]
-
-    passed, result = validate_stock_values(
-        report["opening"],
-        report["received"],
-        report["issued"],
-        report["closing"],
-    )
-
-    stock = ValidatedStock(
-        commodity=commodity,
-        opening=report["opening"],
-        received=report["received"],
-        issued=report["issued"],
-        closing=report["closing"],
-        report_date=report["report_date"],
-        validation_passed=passed,
-    )
-
-    report_text = (
-        f"Ration Seva — {commodity.title()} stock report\n"
-        f"Report date: {report['report_date']}\n"
-        f"Opening stock: {report['opening']} kg\n"
-        f"Received: {report['received']} kg\n"
-        f"Issued: {report['issued']} kg\n"
-        f"Reported closing stock: {report['closing']} kg\n\n"
-        f"Validation: {result}\n\n"
-        "Important: These are sample demonstration figures, not live "
-        "government data or confirmation of physical shop stock."
-    )
-
-    return stock, report_text
-
-
-def get_response(user_text):
-    """Respond to chat messages about sample rice or wheat stock."""
-
-    text = user_text.lower()
-
-    if "rice" in text:
-        commodity = "rice"
-    elif "wheat" in text:
-        commodity = "wheat"
+    if key and not items:
+        message = f"FPS {fps_id} has no {commodity} in this report (not allotted)."
     else:
-        return "Welcome to Ration Seva! Ask me to check rice or wheat stock."
+        message = f"{len(items)} ration item(s) reported for FPS {fps_id}."
 
-    try:
-        _, report_text = get_stock_report(commodity)
-        return report_text
-    except ValueError as exc:
-        return str(exc)
-
-
-# --------------------------------------------------
-# STOCK VALIDATOR AGENT — PORT 8001
-# --------------------------------------------------
-
-agent = Agent(
-    name="ration_seva_agent",
-    seed=os.environ["RATION_VALIDATOR_SEED"],
-    port=8001,
-    mailbox=True,
-)
-
-chat_protocol = Protocol(spec=chat_protocol_spec)
+    return StockResponse(
+        found=True, fps_id=shop["fps_id"], commodity_requested=key,
+        district=shop["district"], afso=shop["afso"],
+        data_time=shop["data_time"], report_date=shop["report_date"],
+        source=shop["source"], is_live=shop.get("is_live", False),
+        commodities=items, flags=flags, message=message,
+    )
 
 
-# Structured request from the Coordinator.
+@agent.on_event("startup")
+async def startup(ctx: Context):
+    ctx.logger.info(f"Loaded {rd.shop_count()} shops from {rd.DATA_PATH} (data_time {rd.data_time()})")
+
+
 @agent.on_message(model=StockRequest, replies={StockResponse})
-async def handle_stock_request(
-    ctx: Context,
-    sender: str,
-    msg: StockRequest,
-):
-    ctx.logger.info(f"Received stock request for {msg.commodity}")
-
-    try:
-        stock, report_text = get_stock_report(msg.commodity)
-
-        response = StockResponse(
-            report=report_text,
-            stock=stock,
-        )
-
-        await ctx.send(sender, response)
-        ctx.logger.info(
-            f"Sent stock validation for {msg.commodity}: "
-            f"{stock.validation_passed}"
-        )
-
-    except ValueError as exc:
-        ctx.logger.warning(str(exc))
-        # The current StockResponse schema requires a stock object.
-        # Unsupported commodities are logged rather than fabricated.
-
-
-# Existing Agentverse chat protocol.
-@chat_protocol.on_message(ChatMessage)
-async def handle_chat_message(
-    ctx: Context,
-    sender: str,
-    msg: ChatMessage,
-):
-    await ctx.send(
-        sender,
-        ChatAcknowledgement(
-            timestamp=datetime.now(timezone.utc),
-            acknowledged_msg_id=msg.msg_id,
-        ),
-    )
-
-    user_text = " ".join(
-        item.text
-        for item in msg.content
-        if isinstance(item, TextContent)
-    ).strip()
-
-    ctx.logger.info(f"Received chat message: {user_text}")
-
-    reply = get_response(user_text)
-
-    await ctx.send(
-        sender,
-        ChatMessage(
-            timestamp=datetime.now(timezone.utc),
-            msg_id=ctx.new_uuid(),
-            content=[
-                TextContent(text=reply),
-                EndSessionContent(),
-            ],
-        ),
-    )
-
-    ctx.logger.info("Sent Ration Seva chat response.")
-
-
-@chat_protocol.on_message(ChatAcknowledgement)
-async def handle_chat_acknowledgement(
-    ctx: Context,
-    sender: str,
-    msg: ChatAcknowledgement,
-):
-    ctx.logger.info(f"Chat acknowledgement received from {sender}")
-
-
-agent.include(chat_protocol, publish_manifest=True)
+async def handle_stock_request(ctx: Context, sender: str, msg: StockRequest):
+    ctx.logger.info(f"Stock request fps_id={msg.fps_id} commodity={msg.commodity}")
+    response = lookup(msg.fps_id.strip(), msg.commodity)
+    ctx.logger.info(f"-> found={response.found} items={len(response.commodities)}")
+    await ctx.send(sender, response)
 
 
 if __name__ == "__main__":

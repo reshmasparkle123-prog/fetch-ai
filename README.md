@@ -1,302 +1,151 @@
-# 🌾 Ration Seva — Know Before You Go
+# RationSeva — multi-agent ration-shop assistant on ASI:One
 
-> **Right Information. Right Ration. Right Time.**
+RationSeva helps ration-card holders in Andhra Pradesh. In one ASI:One chat, in English, Telugu or Hindi, a beneficiary can:
 
-Ration Seva is an AI-powered ration assistance project designed to help beneficiaries check reported Fair Price Shop (FPS) stock information before travelling to collect essential food grains.
+- **check stock** at their fair-price shop (FPS),
+- **find nearby shops** that still have a commodity when their own shop is low,
+- **get a shareable stock-notice poster** in Telugu, Hindi or English, rendered by Cloudinary,
+- **check whether their ration was weighed short** by sending a photo of the scale. Cloudinary OCR reads the display, and the user gets a complaint draft to review and send themselves.
 
-Built for **Fetch-A-Thon 3.0 at Presidency University, Bengaluru**, Ration Seva uses AI agents, stock validation, and conversational assistance to help people make better-informed decisions about ration-shop visits.
+Everything comes from real data: the **AP AePDS "Date wise Stock Details" public report** for **480 fair-price shops** in Alluri Sitharama Raju district (snapshot of **2026-10-20 22:00**), and the live **RationSeva backend** (FastAPI + Cloudinary) at <https://ration-seva.onrender.com> ([API docs](https://ration-seva.onrender.com/docs)).
 
-## 🔗 Project Links
+## The problem
 
-| Resource | Link |
-|---|---|
-| 💬 ASI:One | [Open ASI:One](https://asi1.ai/) |
-| 💬 Working ASI Demo | Pending successful end-to-end conversation |
-| 🤖 Agentverse Agent Profile | [Ration Seva Shortage Analyst](https://agentverse.ai/agents/details/agent1qdj3kmjycxdfj6lp23yzmzg567a78ftn2gk9q5eyqqx8nwm8qy8qkfth24c) |
-| 🐍 Shortage Analyst Agent Address | `agent1qdj3kmjycxdfj6lp23yzmzg567a78ftn2gk9q5eyqqx8nwm8qy8qkfth24c` |
-| 📦 GitHub Repository | [reshmasparkle123-prog/fetch-ai](https://github.com/reshmasparkle123-prog/fetch-ai) |
+Beneficiaries often travel to their ration shop only to find a commodity has run out, and they have no easy way to know which nearby shop still has it. At the counter, under-weighing is hard to prove. The data to answer both questions is public, but it sits in government Excel reports that people can't use from a phone, and it is in English. RationSeva turns that report into a conversation in the beneficiary's own language. It adds two things a text answer can't give: a poster you can forward on WhatsApp, and time-stamped photo evidence of the weighing.
 
-**Note:** The shortage analyst is registered on Agentverse and has shown Active status with Mailbox enabled. A successful ASI:One conversation and the complete multi-agent workflow must be tested before claiming they are fully verified.
+## Architecture
 
-## 🎯 The Problem
+```mermaid
+flowchart LR
+    U["Beneficiary<br/>ASI:One chat<br/>(en / te / hi, photos)"] <-->|chat protocol<br/>via Agentverse mailbox| C
 
-Beneficiaries who depend on India's Public Distribution System (PDS) may travel to a Fair Price Shop without knowing the latest reported availability of essential commodities.
+    subgraph Agents["uAgents (Fetch.ai)"]
+        C["Coordinator :8002<br/>intent + entity parsing<br/>follow-ups, routing, replies"]
+        V["Stock Validator :8001"]
+        S["Shortage Analyst :8003"]
+        N["Notice Agent :8004"]
+        W["Weighing Agent :8005"]
+    end
 
-This can lead to:
+    D[("data/summary.json<br/>480 shops · AePDS<br/>2026-10-20 22:00")]
 
-- Unnecessary trips to ration shops.
-- Time and potential wages lost while travelling or waiting.
-- Uncertainty caused by outdated or incomplete stock information.
-- Difficulty understanding stock reports and deciding what to do next.
+    subgraph Backend["RationSeva backend (Render)"]
+        BN["POST /notice"]
+        BS["POST /scale-check"]
+    end
+    CL[("Cloudinary<br/>text overlays · fonts<br/>upload · stamp · OCR")]
 
-Access to essential food should not involve avoidable uncertainty.
-
-## 💡 Our Solution
-
-**Ration Seva aims to help people make better-informed decisions before visiting their ration shop.**
-
-Through a conversational AI interface, users can ask about shop and commodity stock. The intended workflow retrieves available stock records, validates the reported quantities, and explains the results in simple language.
-
-### Key capabilities
-
-- 🔎 **Stock lookup:** Retrieve reported commodity quantities for a specified shop when a suitable data source is configured.
-- 🧮 **Stock validation:** Check whether reported quantities are arithmetically consistent.
-- 🕒 **Freshness awareness:** Display report dates and warn about outdated information when dates are available.
-- 🛡️ **Responsible responses:** Handle missing, unknown, or inconsistent records without inventing data.
-- 💬 **Conversational assistance:** Support natural-language questions through the intended ASI integration.
-- 🤖 **Agent-based execution:** Use specialised agents and coordination where implemented and verified.
-
-## ⚙️ How It Works
-
-The intended workflow is:
-
-```text
-              BENEFICIARY
-                   |
-                   v
-             ASI:One Chat
-                   |
-                   v
-          Ration Seva Agent
-                   |
-                   v
-          Stock Lookup Tool
-                   |
-                   v
-          Stock Validation
-          - Quantity checks
-          - Arithmetic checks
-          - Date and completeness
-                   |
-                   v
-          Clear Explanation
-          + Source + Warnings
-                   |
-                   v
-        INFORMED USER DECISION
+    C -->|StockRequest| V
+    C -->|ShortageRequest| S
+    C -->|NoticeRequest| N
+    C -->|WeighingRequest| W
+    V --- D
+    S --- D
+    N --> BN --> CL
+    W --> BS --> CL
 ```
 
-The diagram represents the intended architecture. The actual implementation may differ depending on which components and integrations are configured and running.
+| Agent | File | Input → output | What it does |
+|---|---|---|---|
+| **Coordinator** (public, the only ASI:One agent) | [coordinator.py](coordinator.py) | `ChatMessage` → `ChatMessage` | Reads free text in English, Telugu and Hindi ([nlu.py](nlu.py)). Extracts the 7-digit FPS id, commodity, notice language, kg values and photo attachments. Asks a follow-up when something is missing, routes with `send_and_receive` (30 s timeout, one retry), and replies in the user's language ([replies.py](replies.py)). |
+| **Stock Validator** | [main.py](main.py) | `StockRequest` → `StockResponse` | Looks up the shop (and optional commodity) in `data/summary.json`. Returns real quantities, status, `data_time`, source and flags. An unknown FPS gets `found=False`; nothing is invented. |
+| **Shortage Analyst** (internal) | [shortage_analyst.py](shortage_analyst.py) | `ShortageRequest` → `ShortageAnalysis` | Marks an item LOW when closing stock is under 10% of the month's available stock (closing + issued), and OUT when closing is ≤ 0.01. **"Where else can I go?"** suggests up to 3 other shops in the same AFSO that have the commodity AVAILABLE, largest stock first. |
+| **Notice Agent** (internal) | [notice_agent.py](notice_agent.py) | `NoticeRequest` → `NoticeResponse` | Calls `POST /notice`. Cloudinary renders a 1080×1080 stock poster with Telugu, Devanagari or Latin font overlays, using `f_auto`/`q_auto`. Returns the image URL, which is shown inline in chat. |
+| **Weighing Agent** (internal) | [weighing_agent.py](weighing_agent.py) | `WeighingRequest` → `WeighingResponse` | Sends the photo to `POST /scale-check`. Cloudinary stores a time-stamped proof image and OCR reads the scale. The verdict is `OK`, `SHORT_WEIGHT`, `NEEDS_REVIEW` or `UNREADABLE`. On `SHORT_WEIGHT` the agent writes a **complaint draft** that the user must confirm; it is never filed automatically. Without a photo, it compares the weight the user typed. |
 
-## 🧠 Agent Architecture
+Message schemas: [messages.py](messages.py). Shared data access: [ration_data.py](ration_data.py). Shared env and backend helpers: [common.py](common.py).
 
-### 1. Stock Validation Agent
+### How the agents use Cloudinary
 
-Checks stock quantities and identifies arithmetic inconsistencies in the records it receives.
+| Feature | Backend endpoint | Cloudinary work | Where it shows up in chat |
+|---|---|---|---|
+| Stock notice poster | `POST /notice` | Text overlays with uploaded Noto Sans Telugu / Devanagari fonts, `g_auto` crop, `f_auto,q_auto`, signed delivery URL | "Make a Telugu stock notice for 0306122" → inline poster + download link |
+| Weighing check | `POST /scale-check` | Upload, `adv_ocr` text extraction of the scale display, stamped overlay (FPS id, event, IST time) | Photo + "entitled 20 kg" → verdict, stamped proof image, complaint draft that includes the proof URL |
 
-### 2. Shortage Analyst Agent
+The backend also has `POST /proof` (stamp + privacy blur). It isn't wired to an agent yet; see [Limitations](#limitations).
 
-The registered `ration_seva_shortage_analyst` agent is intended to evaluate validated ration-shop stock records and identify potential low-stock signals.
+## Agent addresses
 
-### 3. Coordinator
+These addresses are derived from the seeds in `.env` (`python scripts/setup_env.py` prints them). Seeds are secret and never committed. Run the agents from a different `.env` and the addresses change.
 
-The coordinator is intended to route requests between specialised agents and combine their responses. End-to-end coordination should be claimed as operational only after real agent-to-agent communication has been tested.
-
-### 4. Conversational Interface
-
-ASI:One is the intended conversational interface for beneficiaries to interact with the system.
-
-## 🧮 Stock Calculation
-
-When all required values are available:
-
-**Expected closing stock = Opening stock + Received stock − Issued stock**
-
-For example:
-
-- Opening stock: 300 kg
-- Received stock: 100 kg
-- Issued stock: 150 kg
-- Reported closing stock: 250 kg
-
-Calculation:
-
-`300 + 100 − 150 = 250 kg`
-
-The report is arithmetically consistent because the calculated closing stock matches the reported closing stock.
-
-**Important:** Arithmetic consistency does not prove that the physical stock is available at the shop.
-
-## 🛠️ Technology Stack
-
-| Technology | Purpose |
+| Agent | Address |
 |---|---|
-| Python | Agent implementation and stock validation |
-| Fetch.ai uAgents framework | Building and running agents |
-| Agent Chat Protocol (ACP) | Agent communication, where configured |
-| Agentverse | Agent registration and discovery |
-| ASI:One | Intended conversational interface |
-| Database or stock data source | Stock retrieval, depending on the actual implementation |
-| React + Vite | Optional supporting frontend, only if present in the repository |
-| Supabase | Optional storage integration, only if configured in the implementation |
+| Coordinator | `agent1q0gvf0grxdvpqzg4t4s55p5du4y97daurpd99sq40xc8en4qmkrvga9a2fv` |
+| Stock Validator | `agent1q0ug5kw2v7spm6s6fsyfdrtyvl46zfefxnetx3m0ew6cmqxut5qmuk60m8l` |
+| Shortage Analyst | `agent1qwgz0th408vvcq2fyh507lje9gk6f6tdhjrh6ns8u36xmgfepdgev9yqfth` |
+| Notice Agent | `agent1qgmcr9ch2vlpkpl8rj5rmaaez58pgtl5u5urxn96r8xnykd83sue2wkhj2u` |
+| Weighing Agent | `agent1q2jhnea464u46ewhc0d42qf9dquzhyau0uxevha3c8h9dstfsfu6s2qnel7` |
 
-The final technology list should match the code and services actually used in the submitted version.
+> The Shortage Analyst previously registered on Agentverse (`agent1qdj3kmjycxdfj6lp23yzmzg567a78ftn2gk9q5eyqqx8nwm8qy8qkfth24c`) used a seed that isn't in this repo. To keep that address, put that seed in `SHORTAGE_ANALYST_SEED` and rerun `scripts/setup_env.py`.
 
-## 🛡️ Data Integrity and Error Handling
+## Run it
 
-Trust and transparency are central to Ration Seva.
-
-| Scenario | Expected behaviour |
-|---|---|
-| Valid stock record | Return the available quantities and report date |
-| Inconsistent quantities | Flag the arithmetic mismatch |
-| Negative quantities | Reject or flag invalid data |
-| Missing fields | Explain that the record is incomplete |
-| Outdated report | Warn that the information may not reflect current conditions |
-| Unknown shop ID | Ask the user to verify the identifier |
-| Database failure | Return a clear error rather than fabricate results |
-| Unverified source | Disclose the source and its verification status |
-
-These are expected behaviours; each should be tested before being marked as implemented.
-
-## 🧪 Testing Checklist
-
-Record the actual outcome of each test before marking it as passed.
-
-- [ ] Valid stock record produces the expected arithmetic result.
-- [ ] Inconsistent quantities are flagged.
-- [ ] Negative quantities are rejected or flagged.
-- [ ] Missing fields are handled safely.
-- [ ] An outdated report produces a warning.
-- [ ] An unknown shop ID does not produce fabricated information.
-- [ ] A data-source failure produces a clear error.
-- [ ] The shortage analyst returns an actual response.
-- [ ] Agent-to-agent communication is verified, if applicable.
-- [ ] An ASI:One conversation completes successfully.
-- [ ] The working conversation URL and evidence are saved for submission.
-
-## 🚀 Getting Started
-
-### Prerequisites
-
-- Python version supported by the project's dependencies.
-- Git.
-- Access to the repository.
-- Agentverse account and agent configuration.
-- Any database credentials required by the actual implementation.
-
-### 1. Clone the repository
+Requires Python 3.11 or 3.12 (uagents does not support 3.14 yet).
 
 ```bash
-git clone https://github.com/reshmasparkle123-prog/fetch-ai.git
-cd fetch-ai
-```
-
-### 2. Create a virtual environment
-
-macOS/Linux:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-```
-
-Windows PowerShell:
-
-```powershell
 python -m venv .venv
-.venv\Scripts\Activate.ps1
-```
-
-### 3. Install dependencies
-
-If the repository includes `requirements.txt`:
-
-```bash
+.venv\Scripts\activate            # Windows  (source .venv/bin/activate on macOS/Linux)
 pip install -r requirements.txt
+python scripts/setup_env.py       # creates .env, generates missing seeds, fills in agent addresses
 ```
 
-Use the dependency manager and installation instructions provided by the actual project if they differ.
-
-### 4. Configure environment variables
-
-Create a local `.env` file containing the variables required by the code. For example:
-
-```env
-SUPABASE_URL=your_project_url
-SUPABASE_KEY=your_appropriate_access_key
-```
-
-Only add variables that the implementation actually uses. Agent seeds and credentials must be kept private.
-
-### 5. Run the agents
-
-Use the entry-point filenames and commands defined in the repository. For example, if these files exist and are configured to run independently:
+**Local test (no Agentverse needed):**
 
 ```bash
-python main.py
+python scripts/run_local.py --no-mailbox     # terminal 1: all five agents, logs in logs/
+python scripts/test_chat.py                  # terminal 2: chats with the Coordinator like ASI:One does
+python scripts/test_chat.py notice_te weighing --photo path/to/scale.jpg   # selected scenarios
 ```
 
-```bash
-python shortage_analyst.py
+`test_chat.py` sends real chat-protocol messages, including photos as `ResourceContent`. It prints the conversation and writes it to `logs/test_chat_results.md`. A recorded run, including the agent-down cases, is in [docs/TEST_RESULTS.md](docs/TEST_RESULTS.md).
+
+**For ASI:One:** run `python scripts/run_local.py` (Coordinator with a mailbox), then connect the mailbox once. The steps are in [agentverse/COORDINATOR_README.md](agentverse/COORDINATOR_README.md#connect-the-mailbox-one-time).
+
+### Environment
+
+See [.env.example](.env.example): `BACKEND_URL`, the five seeds, the four internal agent addresses, `*_MAILBOX` switches (only the Coordinator needs a mailbox), `AGENT_TIMEOUT=30`, `BACKEND_TIMEOUT=25`.
+
+## Try these in ASI:One
+
+- "Is rice available at shop 0306122?"
+- "Rice is low at my shop, where else can I go?" (the agent asks for the shop number)
+- "Make a Telugu stock notice for 0306122"
+- "Check my ration weight" + attach a photo of the scale (the agent asks for the shop number and entitled kg)
+- "0306122 షాప్‌లో బియ్యం ఉందా?" · "मेरी दुकान 0306122 में चावल कम है, और कहाँ मिलेगा?"
+
+## Reliability
+
+- Every agent call uses `send_and_receive` with a 30 s timeout and **one retry**.
+- Render's free tier sleeps and can take ~50 s to wake. The Notice and Weighing agents ping `/health` on startup, and each backend call times out at 25 s with `retryable=True`, so the Coordinator's retry lands on a warm backend.
+- If an agent is down, the user gets a clear localized message. When it makes sense, they also get the real stock as text: the notice falls back to the stock list, and a missing analysis falls back to the report status. Verified in [docs/TEST_RESULTS.md](docs/TEST_RESULTS.md).
+
+## Limitations
+
+- **Dated snapshot, not live.** All stock is from the AePDS report of 2026-10-20 22:00, and every reply says so. Stock may have changed since then.
+- **Coverage:** 480 shops in one district (Alluri Sitharama Raju). Any other FPS id gets "not found".
+- **Alternatives** are grouped by AFSO (the data has no mandal or GPS). They are suggestions from the same snapshot, not distances.
+- **Language understanding is rule-based** (keywords + regex). That keeps it predictable, but unusual phrasing gets the help message or a follow-up question.
+- **Complaints are drafts only.** RationSeva never files anything; the user sends it (PDS helpline 1967, Mandal office or grievance portal).
+- **ASI:One photo attachments** arrive through Agentverse storage. The Coordinator downloads them with its own agent identity and forwards the bytes. Locally this path was tested with URL and `data:` URI attachments; check it once in ASI:One after connecting the mailbox.
+- The internal agents use `127.0.0.1` endpoints, so they must run on the same machine as the Coordinator (or set their `*_MAILBOX=true`).
+- `POST /proof` (doorstep-delivery / complaint photos with privacy blur) is not wired to an agent yet.
+- `stock_tools.py` is a standalone opening/received/issued/closing balance checker kept from the first prototype. The agents don't use it, because the published report has no opening balance.
+
+## Repository layout
+
 ```
-
-```bash
-python coordinator.py
+coordinator.py         ASI:One chat agent (routing, follow-ups, replies)
+main.py                Stock Validator
+shortage_analyst.py    Shortage Analyst + "where else can I go?"
+notice_agent.py        Cloudinary stock notice (POST /notice)
+weighing_agent.py      Cloudinary OCR weighing check (POST /scale-check)
+messages.py            uAgents message models
+nlu.py / replies.py    en/te/hi understanding and reply templates
+ration_data.py         data/summary.json access, status rule, alternatives
+common.py              env, agent factory, backend client
+data/summary.json      480-shop AePDS snapshot (2026-10-20 22:00)
+scripts/               setup_env.py, run_local.py, test_chat.py
+agentverse/            Agentverse READMEs (Coordinator, Shortage Analyst)
+docs/TEST_RESULTS.md   recorded local test run
+NOTION_NOTES.md        decisions, challenges, learnings
 ```
-
-Run each process only as required by the project architecture. Check the actual configuration for ports, addresses, and environment variables before starting multiple agents.
-
-### 6. Run tests
-
-If automated tests are configured:
-
-```bash
-pytest
-```
-
-Otherwise, follow the project's documented manual test procedure and record the results.
-
-## 🔐 Security
-
-- Never commit `.env` files, private agent seeds, passwords, or API keys.
-- Use least-privilege database credentials.
-- Keep sensitive credentials out of logs and public documentation.
-- Do not publish private beneficiary information.
-- Validate user input and handle external service failures safely.
-
-## 📊 Data Disclaimer
-
-Ration Seva must distinguish between demonstration records, user-reported records, and information from verified external sources.
-
-If sample data is used, it must be labelled as sample data and must not be represented as live government PDS information.
-
-Stock reports may be outdated, incomplete, or inconsistent. Even an arithmetically valid report does not guarantee physical stock availability at a Fair Price Shop.
-
-Beneficiaries should confirm uncertain or outdated information with the relevant shop or authorised source before travelling.
-
-## 🌱 Future Scope
-
-- Multilingual assistance in Kannada, Hindi, and English.
-- Integration with reliable official PDS data sources where access is available.
-- Verified multi-agent coordination for retrieval, validation, and assistance.
-- Improved stock summaries and accessible conversational interactions.
-- Shop notices and supporting evidence uploads.
-- Accessibility improvements for users with limited digital literacy.
-
-These are future goals unless explicitly implemented and verified.
-
-## 👥 Team
-
-**Team:** Ration Seva  
-**Event:** Fetch-A-Thon 3.0  
-**Venue:** Presidency University, Bengaluru
-
-| Team member | Role |
-|---|---|
-| Amulya R | Team Lead |
-| Athulya Anil | Project Team |
-| Disha R | Project Team |
-| Reshma | Project Team |
-
-## 🏆 Our Vision
-
-We want to make essential ration information simpler, more transparent, and more useful for the people who depend on it.
-
-Ration Seva connects conversational AI with stock information and validation to help beneficiaries make better-informed decisions.
-
-**Know Before You Go.**
-
-## 📄 License
-
-A licence has not yet been specified. Add a `LICENSE` file and update this section once the team chooses a licence. Do not claim an open-source licence before it has been committed to the repository.
